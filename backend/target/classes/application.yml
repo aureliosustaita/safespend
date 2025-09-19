@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: update
+  datasource:
+    url: jdbc:h2:mem:safespend;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    driverClassName: org.h2.Driver
+    username: sa
+    password: ''
+  application:
+    name: safespend   # <— added
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0      # <— added
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans  # <— added
+
+resilience4j:
+  retry:
+    instances:
+      ingest:
+        max-attempts: 3
+        wait-duration: 200ms
+        retry-exceptions:
+          - java.io.IOException
+          - java.lang.RuntimeException
+  circuitbreaker:
+    instances:
+      ingest:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 5s
+        permitted-number-of-calls-in-half-open-state: 3
