@@ -17,7 +17,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       probes:
@@ -28,6 +28,11 @@ management:
   zipkin:
     tracing:
       endpoint: http://localhost:9411/api/v2/spans  # <— added
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
 
 resilience4j:
   retry:
@@ -46,3 +51,4 @@ resilience4j:
         failure-rate-threshold: 50
         wait-duration-in-open-state: 5s
         permitted-number-of-calls-in-half-open-state: 3
+
