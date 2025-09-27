@@ -1,17 +1,21 @@
 package com.safespend.service;
 
 import com.safespend.domain.Transaction;
-import com.safespend.repo.TransactionRepo;
 import com.safespend.repo.AlertRepo;
+import com.safespend.repo.TransactionRepo;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
 import io.micrometer.core.annotation.Timed;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class TxnIngestService {
@@ -22,6 +26,14 @@ public class TxnIngestService {
   private final AlertRepo alertRepo;
   private final AnomalyService anomaly;
 
+  // Dev toggle for simulating flaky downstream behavior (default: off)
+  @Value("${safespend.ingest.simulate-failure:false}")
+  private boolean simulateFailure;
+
+  // Probability used when simulateFailure=true
+  @Value("${safespend.ingest.simulate-failure-rate:0.10}")
+  private double simulateFailureRate;
+
   public TxnIngestService(TransactionRepo t, AlertRepo a, AnomalyService an) {
     this.txRepo = t;
     this.alertRepo = a;
@@ -30,21 +42,6 @@ public class TxnIngestService {
 
   /**
    * Retries + Circuit Breaker configured under name "ingest" in application-postgres.yml
-   * Example:
-   *
-   * resilience4j:
-   *   retry:
-   *     instances:
-   *       ingest:
-   *         max-attempts: 3
-   *         wait-duration: 200ms
-   *   circuitbreaker:
-   *     instances:
-   *       ingest:
-   *         sliding-window-type: COUNT_BASED
-   *         sliding-window-size: 20
-   *         failure-rate-threshold: 50
-   *         wait-duration-in-open-state: 10s
    */
   @Timed(value = "txn_ingest", description = "Time taken to ingest a transaction")
   @Transactional
@@ -55,24 +52,13 @@ public class TxnIngestService {
       t.setTimestamp(Instant.now());
     }
 
-    // OPTIONAL: simulate a flaky downstream (~10%) to demo retries/CB behavior.
-    // Remove this block for real prod behavior.
-    if (Math.random() < 0.10) {
+    // OPTIONAL demo failure to visualize retries/CB (enable via property)
+    if (simulateFailure && ThreadLocalRandom.current().nextDouble() < simulateFailureRate) {
       throw new RuntimeException("Simulated downstream timeout");
     }
 
     Transaction saved = txRepo.save(t);
-
-    var history = txRepo
-        .findTop200ByUserIdAndCategoryOrderByTimestampDesc(t.getUserId(), t.getCategory())
-        .stream()
-        .map(Transaction::getAmount)
-        .toList();
-
-    anomaly
-        .evaluate(t.getUserId(), t.getCategory(), t.getAmount(), history)
-        .ifPresent(alertRepo::save);
-
+    evaluateAndMaybeAlert(saved);
     return saved;
   }
 
@@ -86,20 +72,35 @@ public class TxnIngestService {
     log.warn("Fallback ingest invoked due to: {}", ex.toString());
 
     // Mark transaction as pending so the UI can reflect degraded ingestion.
-    t.setMerchant(t.getMerchant() + " (pending)");
+    String m = t.getMerchant();
+    t.setMerchant((m == null || m.isBlank() ? "" : m + " ") + "(pending)");
 
     Transaction saved = txRepo.save(t);
+    evaluateAndMaybeAlert(saved);
+    return saved;
+  }
 
-    var history = txRepo
+  // ----- helpers -----
+
+  private void evaluateAndMaybeAlert(Transaction t) {
+    // Convert historical BigDecimal amounts -> Double for anomaly service
+    List<Double> history = txRepo
         .findTop200ByUserIdAndCategoryOrderByTimestampDesc(t.getUserId(), t.getCategory())
         .stream()
-        .map(Transaction::getAmount)
+        .map(Transaction::getAmount)   // BigDecimal
+        .filter(Objects::nonNull)
+        .map(bd -> bd.doubleValue())   // -> Double
         .toList();
 
-    anomaly
-        .evaluate(t.getUserId(), t.getCategory(), t.getAmount(), history)
-        .ifPresent(alertRepo::save);
+    // Current txn amount: BigDecimal -> double
+    double amount = t.getAmount() != null ? t.getAmount().doubleValue() : 0.0;
 
-    return saved;
+    anomaly.evaluate(t.getUserId(), t.getCategory(), amount, history)
+        .ifPresent(a -> {
+          alertRepo.save(a);
+          // 🔔 Log when we actually create an alert
+          log.info("ALERT created: user={} cat={} amt={} median={} mad={} z={}",
+              a.getUserId(), a.getCategory(), a.getAmount(), a.getMedian(), a.getMad(), a.getZScore());
+        });
   }
 }
